@@ -1,2 +1,2 @@
 # lidar-unity
-A lidar code and setup using particles in unity 6
+A lidar scanner code and setup using particles in unity 6
