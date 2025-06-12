@@ -1,0 +1,270 @@
+using UnityEngine;
+using UnityEngine.InputSystem;
+using System.Collections;
+using System.Collections.Generic;
+
+public class OptimizedLidarScanner : MonoBehaviour
+{
+    [Header("LIDAR Settings")]
+    public ParticleSystem lidarParticleSystem; // Drag your particle system here
+    public float scanRange = 50f;
+    public float scanConeAngle = 10f;
+    public int maxPointsPerScan = 40;
+    public LayerMask scanLayerMask = -1;
+    public float pointLifetime = 5f;
+    public float continuousScanRate = 0.1f;
+
+    [Header("Particle Settings")]
+    public float particleSize = 0.1f;
+    public Color particleColor = Color.red;
+    public AnimationCurve sizeOverLifetime = AnimationCurve.Linear(0, 1, 1, 0);
+    public AnimationCurve alphaOverLifetime = AnimationCurve.Linear(0, 1, 1, 0);
+
+    [Header("Performance")]
+    public int raysPerFrame = 5;
+    public float cleanupInterval = 1f;
+    public int maxConcurrentScans = -1; // -1 = unlimited, 0+ = limit concurrent scans
+
+    [Header("Debug")]
+    public bool showDebugInfo = false;
+
+    private float lastScanTime = 0f;
+    private int activeScanCoroutines = 0;
+    private ParticleSystem.EmitParams emitParams;
+
+    void Start()
+    {
+        // Configure particle system if not already set up
+        if (lidarParticleSystem != null)
+        {
+            ConfigureParticleSystem();
+        }
+
+        // Initialize emit parameters
+        emitParams = new ParticleSystem.EmitParams();
+    }
+
+    void ConfigureParticleSystem()
+    {
+        var main = lidarParticleSystem.main;
+        main.startLifetime = pointLifetime;
+        main.startSpeed = 0f; // Points don't move
+        main.startSize = particleSize;
+        main.startColor = particleColor;
+
+        // Increase max particles to handle continuous scanning
+        // Calculate: (points per scan) * (scans per second) * (lifetime)
+        int estimatedMaxParticles = Mathf.RoundToInt(maxPointsPerScan * (1f / continuousScanRate) * pointLifetime);
+        main.maxParticles = Mathf.Max(2000, estimatedMaxParticles * 2); // Add buffer
+
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+
+        // Configure size over lifetime
+        var sizeOverLifetimeModule = lidarParticleSystem.sizeOverLifetime;
+        sizeOverLifetimeModule.enabled = true;
+        sizeOverLifetimeModule.size = new ParticleSystem.MinMaxCurve(1f, sizeOverLifetime);
+
+        // Configure color over lifetime for fade effect
+        var colorOverLifetimeModule = lidarParticleSystem.colorOverLifetime;
+        colorOverLifetimeModule.enabled = true;
+        Gradient gradient = new Gradient();
+        gradient.SetKeys(
+            new GradientColorKey[] { new GradientColorKey(particleColor, 0.0f), new GradientColorKey(particleColor, 1.0f) },
+            new GradientAlphaKey[] { new GradientAlphaKey(1.0f, 0.0f), new GradientAlphaKey(0.0f, 1.0f) }
+        );
+        colorOverLifetimeModule.color = gradient;
+
+        // Disable emission - we'll emit manually
+        var emission = lidarParticleSystem.emission;
+        emission.enabled = false;
+
+        // Make sure the system is playing
+        if (!lidarParticleSystem.isPlaying)
+        {
+            lidarParticleSystem.Play();
+        }
+    }
+
+    void Update()
+    {
+        // Debug info
+        if (showDebugInfo && lidarParticleSystem != null)
+        {
+            Debug.Log($"Active Particles: {lidarParticleSystem.particleCount}, Max Particles: {lidarParticleSystem.main.maxParticles}, Active Scans: {activeScanCoroutines}");
+        }
+
+        if (Keyboard.current.qKey.wasPressedThisFrame)
+        {
+            if (CanStartNewScan())
+            {
+                StartCoroutine(ScanCoroutine());
+                lastScanTime = Time.time;
+            }
+            else
+            {
+                if (showDebugInfo) Debug.Log("Cannot start new scan - limit reached");
+            }
+        }
+        else if (Keyboard.current.qKey.isPressed && Time.time - lastScanTime > continuousScanRate)
+        {
+            if (CanStartNewScan())
+            {
+                StartCoroutine(ScanCoroutine());
+                lastScanTime = Time.time;
+            }
+            else
+            {
+                if (showDebugInfo) Debug.Log("Cannot start new scan - limit reached");
+            }
+        }
+    }
+
+    bool CanStartNewScan()
+    {
+        // Check particle system capacity first
+        if (lidarParticleSystem != null)
+        {
+            int currentParticles = lidarParticleSystem.particleCount;
+            int maxParticles = lidarParticleSystem.main.maxParticles;
+
+            // If we're close to the particle limit, don't start new scans
+            if (currentParticles + maxPointsPerScan > maxParticles)
+            {
+                if (showDebugInfo) Debug.Log($"Particle system near capacity: {currentParticles}/{maxParticles}");
+                return false;
+            }
+        }
+
+        // If maxConcurrentScans is -1, allow unlimited scans
+        if (maxConcurrentScans == -1)
+            return true;
+
+        // Otherwise, check if we're under the limit
+        return activeScanCoroutines < maxConcurrentScans;
+    }
+
+    IEnumerator ScanCoroutine()
+    {
+        activeScanCoroutines++;
+        int raysProcessed = 0;
+
+        for (int i = 0; i < maxPointsPerScan; i++)
+        {
+            CastRandomRayAndEmitParticle();
+            raysProcessed++;
+
+            if (raysProcessed >= raysPerFrame)
+            {
+                raysProcessed = 0;
+                yield return null;
+            }
+        }
+
+        activeScanCoroutines--;
+    }
+
+    void CastRandomRayAndEmitParticle()
+    {
+        // Generate random direction within the cone
+        float randomHorizontal = Random.Range(-scanConeAngle / 2f, scanConeAngle / 2f);
+        float randomVertical = Random.Range(-scanConeAngle / 2f, scanConeAngle / 2f);
+
+        Vector3 direction = CalculateRayDirection(randomHorizontal, randomVertical);
+
+        RaycastHit hit;
+        if (Physics.Raycast(transform.position, direction, out hit, scanRange, scanLayerMask))
+        {
+            EmitLidarParticle(hit.point, hit.normal);
+            if (showDebugInfo) Debug.DrawRay(transform.position, direction * hit.distance, Color.red, 0.1f);
+        }
+        else
+        {
+            if (showDebugInfo) Debug.DrawRay(transform.position, direction * scanRange, Color.blue, 0.1f);
+        }
+    }
+
+    Vector3 CalculateRayDirection(float horizontalOffset, float verticalOffset)
+    {
+        float hRad = horizontalOffset * Mathf.Deg2Rad;
+        float vRad = verticalOffset * Mathf.Deg2Rad;
+
+        Vector3 localDirection = new Vector3(
+            Mathf.Sin(hRad),
+            Mathf.Sin(vRad),
+            Mathf.Cos(hRad) * Mathf.Cos(vRad)
+        );
+
+        return transform.TransformDirection(localDirection.normalized);
+    }
+
+    void EmitLidarParticle(Vector3 position, Vector3 normal)
+    {
+        if (lidarParticleSystem != null)
+        {
+            emitParams.position = position;
+            emitParams.velocity = Vector3.zero;
+            emitParams.startLifetime = pointLifetime;
+            emitParams.startSize = particleSize;
+            emitParams.startColor = particleColor;
+
+            // Optional: Orient particle based on surface normal
+            emitParams.rotation3D = Quaternion.LookRotation(normal).eulerAngles;
+
+            lidarParticleSystem.Emit(emitParams, 1);
+        }
+    }
+
+    public void ClearAllPoints()
+    {
+        if (lidarParticleSystem != null)
+        {
+            lidarParticleSystem.Clear();
+        }
+    }
+
+    // Add this method to force cleanup if needed
+    public void ForceCleanupOldParticles()
+    {
+        if (lidarParticleSystem != null)
+        {
+            // Get current particles
+            ParticleSystem.Particle[] particles = new ParticleSystem.Particle[lidarParticleSystem.main.maxParticles];
+            int numParticlesAlive = lidarParticleSystem.GetParticles(particles);
+
+            // Remove particles that are very old (optional aggressive cleanup)
+            int validParticles = 0;
+            for (int i = 0; i < numParticlesAlive; i++)
+            {
+                if (particles[i].remainingLifetime > 0.1f) // Keep particles with more than 0.1s left
+                {
+                    particles[validParticles] = particles[i];
+                    validParticles++;
+                }
+            }
+
+            // Set the modified particle array back
+            lidarParticleSystem.SetParticles(particles, validParticles);
+        }
+    }
+
+    void OnDrawGizmosSelected()
+    {
+        // Same gizmo drawing code as before
+        Gizmos.color = Color.green;
+        Gizmos.DrawWireSphere(transform.position, scanRange);
+
+        Gizmos.color = Color.yellow;
+        float halfAngle = scanConeAngle / 2f;
+        Vector3 forward = transform.forward * scanRange;
+        Vector3 right = transform.right * Mathf.Tan(halfAngle * Mathf.Deg2Rad) * scanRange;
+        Vector3 up = transform.up * Mathf.Tan(halfAngle * Mathf.Deg2Rad) * scanRange;
+
+        Gizmos.DrawRay(transform.position, forward + right + up);
+        Gizmos.DrawRay(transform.position, forward + right - up);
+        Gizmos.DrawRay(transform.position, forward - right + up);
+        Gizmos.DrawRay(transform.position, forward - right - up);
+
+        Gizmos.color = Color.blue;
+        Gizmos.DrawRay(transform.position, forward);
+    }
+}
